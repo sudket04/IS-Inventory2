@@ -68,7 +68,9 @@ CREATE TABLE dbo.vlans (
     vlan_zone    NVARCHAR(30)  NULL,    -- Trust/Untrust/DMZ — the firewall zone it rides on
     vlan_by      NVARCHAR(60)  NULL,    -- what created/owns it, e.g. "Core Switch"
     device_name  NVARCHAR(80)  NULL,    -- the actual device hostname, e.g. "mcp-1"
-    location_id  VARCHAR(20)   NULL
+    /* NOT NULL: a VLAN must be filed under a site, same as hardware — the
+       UI's site selector is a required field on every data-entry form. */
+    location_id  VARCHAR(20)   NOT NULL
                  CONSTRAINT FK_vlans_location REFERENCES dbo.locations(location_id),
     routing      NVARCHAR(120) NULL,
     remarks      NVARCHAR(400) NULL,

@@ -64,8 +64,11 @@ CREATE TABLE dbo.hardware (
 
     /* Location: a Rack row in dbo.locations, plus where in that rack.
        rack_u_start/rack_u_size replace the old free-text u_position so the
-       API can answer "is U20-U21 of rack A12 already taken?" before saving. */
-    location_id        VARCHAR(20)   NULL
+       API can answer "is U20-U21 of rack A12 already taken?" before saving.
+       NOT NULL: every hardware record must resolve to a site (v_location_tree
+       walks parent_id up to the Site row) — the UI's site selector is a
+       required field, not optional. */
+    location_id        VARCHAR(20)   NOT NULL
                        CONSTRAINT FK_hardware_location REFERENCES dbo.locations(location_id),
     rack_u_start       INT           NULL
                        CONSTRAINT CK_hardware_u_start CHECK (rack_u_start IS NULL OR rack_u_start BETWEEN 1 AND 60),

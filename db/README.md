@@ -88,6 +88,13 @@ looking broken. All three are real constrained columns now.
 `hardware` kept four loose strings, which made every per-site report and any
 per-site permission unreliable. Both point at `dbo.locations`.
 
+**Site is a required field on every data-entry table, not an afterthought.**
+`hardware.location_id` and `vlans.location_id` are `NOT NULL` — a record
+cannot be saved without resolving to a site (`v_location_tree` walks
+`parent_id` up to the `Site` row). The org only has two sites in practice
+(1st Site, 2nd Site); that is enforced by what `10_seed.sql` seeds, not by a
+database CHECK, so a third site can be added later without a migration.
+
 **Derived values are computed, not typed.** `warranty_expiry` is
 `commission_date + warranty_years`, a `PERSISTED` computed column — it cannot
 be typed to disagree with the rule that produced it. (The DHCP pool used to

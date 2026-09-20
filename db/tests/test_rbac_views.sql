@@ -117,8 +117,8 @@ INSERT INTO dbo.server_disks (disk_id, server_id, drive_letter, capacity, unit)
 VALUES ('DSK-T01', 'SRV-T01', N'C:', 100, 'GB'),
        ('DSK-T02', 'SRV-T01', N'D:', 1,   'TB');
 
-INSERT INTO dbo.vlans (vlan_id_pk, vlan_tag, vlan_name, device_name)
-VALUES ('VLA-T10', 120, N'HDC-SERVER', N'mcp-1');
+INSERT INTO dbo.vlans (vlan_id_pk, vlan_tag, vlan_name, device_name, location_id)
+VALUES ('VLA-T10', 120, N'HDC-SERVER', N'mcp-1', 'LOC-T01');
 
 INSERT INTO dbo.vlan_subnets (subnet_id, vlan_id_pk, level, network_num, prefix_len,
                               gateway_num, ip_assignment, dhcp_server_num, dhcp_start_num, dhcp_end_num)

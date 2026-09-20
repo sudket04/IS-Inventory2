@@ -59,8 +59,11 @@ FROM (VALUES
    and the reason vlans/vlan_subnets are two separate tables.
    =========================================================================== */
 PRINT '=== VLAN with 5 subnets (1 Primary, 4 Secondary), same tag ===';
-INSERT INTO dbo.vlans (vlan_id_pk, vlan_tag, vlan_name, vlan_zone, vlan_by, device_name)
-VALUES ('VLA-T01', 4, N'FAC1', N'Trust', N'Core Switch', N'mcp-1');
+DECLARE @site1 VARCHAR(20) = (SELECT location_id FROM dbo.locations WHERE level = 'Site' AND name = N'1st Site');
+DECLARE @site2 VARCHAR(20) = (SELECT location_id FROM dbo.locations WHERE level = 'Site' AND name = N'2nd Site');
+
+INSERT INTO dbo.vlans (vlan_id_pk, vlan_tag, vlan_name, vlan_zone, vlan_by, device_name, location_id)
+VALUES ('VLA-T01', 4, N'FAC1', N'Trust', N'Core Switch', N'mcp-1', @site1);
 
 INSERT INTO dbo.vlan_subnets (subnet_id, vlan_id_pk, level, network_num, prefix_len, gateway_num)
 VALUES
@@ -86,8 +89,8 @@ BEGIN CATCH
 END CATCH;
 
 PRINT '=== Untagged VLAN (native VLAN on the trunk) ===';
-INSERT INTO dbo.vlans (vlan_id_pk, vlan_tag, vlan_name, vlan_zone, vlan_by, device_name)
-VALUES ('VLA-T02', NULL, N'ThinServer-Mgmt', N'Trust', N'Core Switch', N'mcp-1');
+INSERT INTO dbo.vlans (vlan_id_pk, vlan_tag, vlan_name, vlan_zone, vlan_by, device_name, location_id)
+VALUES ('VLA-T02', NULL, N'ThinServer-Mgmt', N'Trust', N'Core Switch', N'mcp-1', @site1);
 
 SELECT test = 'vlan_tag NULL renders as is_untagged = 1',
        vlan_tag, is_untagged,
@@ -102,8 +105,8 @@ SELECT test = 'both VLA-T01 (tag 4) and VLA-T02 (untagged) coexist',
 
 PRINT '--- constraint: same tag cannot repeat on the same device ---';
 BEGIN TRY
-    INSERT INTO dbo.vlans (vlan_id_pk, vlan_tag, vlan_name, device_name)
-    VALUES ('VLA-T03', 4, N'FAC1-DUP', N'mcp-1');
+    INSERT INTO dbo.vlans (vlan_id_pk, vlan_tag, vlan_name, device_name, location_id)
+    VALUES ('VLA-T03', 4, N'FAC1-DUP', N'mcp-1', @site1);
     SELECT test = 'reject VLAN tag 4 twice on device mcp-1', result = 'FAIL (it was accepted)';
 END TRY
 BEGIN CATCH
@@ -112,8 +115,8 @@ END CATCH;
 
 SELECT test = 'the same tag 4 IS allowed on a different device',
        result = 'n/a (exercised below)';
-INSERT INTO dbo.vlans (vlan_id_pk, vlan_tag, vlan_name, device_name)
-VALUES ('VLA-T04', 4, N'FAC1-OTHER-SWITCH', N'mcp-2');
+INSERT INTO dbo.vlans (vlan_id_pk, vlan_tag, vlan_name, device_name, location_id)
+VALUES ('VLA-T04', 4, N'FAC1-OTHER-SWITCH', N'mcp-2', @site2);
 SELECT test = 'VLAN tag 4 on device mcp-2 (a different device) is accepted',
        result = 'PASS';
 
@@ -124,8 +127,8 @@ SELECT test = 'VLAN tag 4 on device mcp-2 (a different device) is accepted',
    one static block").
    =========================================================================== */
 PRINT '=== one subnet, DHCP in the middle, static on both sides ===';
-INSERT INTO dbo.vlans (vlan_id_pk, vlan_tag, vlan_name, vlan_zone, vlan_by, device_name)
-VALUES ('VLA-T05', 152, N'WIFI-Data-Center', N'Trust', N'Core Switch', N'mcp-1');
+INSERT INTO dbo.vlans (vlan_id_pk, vlan_tag, vlan_name, vlan_zone, vlan_by, device_name, location_id)
+VALUES ('VLA-T05', 152, N'WIFI-Data-Center', N'Trust', N'Core Switch', N'mcp-1', @site1);
 
 INSERT INTO dbo.vlan_subnets (subnet_id, vlan_id_pk, level, network_num, prefix_len,
                               gateway_num, ip_assignment, dhcp_server_num, dhcp_start_num, dhcp_end_num)
@@ -236,8 +239,8 @@ END CATCH;
    Basic subnet arithmetic still holds for a plain single-subnet VLAN
    --------------------------------------------------------------------------- */
 PRINT '--- a /30 leaves exactly 2 usable addresses ---';
-INSERT INTO dbo.vlans (vlan_id_pk, vlan_tag, vlan_name, device_name)
-VALUES ('VLA-T06', 999, N'TEST-p2p', N'mcp-1');
+INSERT INTO dbo.vlans (vlan_id_pk, vlan_tag, vlan_name, device_name, location_id)
+VALUES ('VLA-T06', 999, N'TEST-p2p', N'mcp-1', @site1);
 INSERT INTO dbo.vlan_subnets (subnet_id, vlan_id_pk, level, network_num, prefix_len, gateway_num)
 VALUES ('SUB-T20', 'VLA-T06', 'Primary', dbo.fn_IpToInt('10.99.99.0'), 30, dbo.fn_IpToInt('10.99.99.1'));
 SELECT test = '/30 -> 10.99.99.1 .. 10.99.99.2',
