@@ -97,40 +97,56 @@ GO
 /* ---------------------------------------------------------------------------
    v_vlan_utilization — how full is each subnet?
 
-   The question v1 could not answer at all, because addresses were text
-   scattered across four tables.
+   One row per dbo.vlan_subnets row (a VLAN with 5 secondary subnets shows 5
+   rows here, Level tells them apart), since utilisation is a property of a
+   subnet, not of the VLAN tag it rides on. Static ranges are rolled up from
+   dbo.vlan_static_ranges — there can be 0, 1, or several per subnet.
    --------------------------------------------------------------------------- */
 CREATE OR ALTER VIEW dbo.v_vlan_utilization
 AS
-SELECT v.vlan_id_pk,
-       v.vlan_id,
+SELECT s.subnet_id,
+       s.vlan_id_pk,
+       v.vlan_tag,
+       v.is_untagged,
        v.vlan_name,
-       v.purpose,
-       cidr            = v.network_address + '/' + CAST(v.prefix_len AS VARCHAR(2)),
-       v.network_address,
-       v.subnet_mask,
-       gateway         = dbo.fn_IntToIp(v.gateway_num),
-       v.usable_count,
+       s.level,
+       cidr            = s.network_address + '/' + CAST(s.prefix_len AS VARCHAR(2)),
+       s.network_address,
+       s.subnet_mask,
+       gateway         = dbo.fn_IntToIp(s.gateway_num),
+       s.usable_count,
        assigned_count  = ISNULL(a.cnt, 0),
-       free_count      = v.usable_count - ISNULL(a.cnt, 0),
-       used_percent    = CAST(100.0 * ISNULL(a.cnt, 0) / NULLIF(v.usable_count, 0) AS DECIMAL(5,1)),
-       dhcp_enabled    = v.dhcp_enabled,
-       dhcp_start      = dbo.fn_IntToIp(v.dhcp_start_num),
-       dhcp_end        = dbo.fn_IntToIp(v.dhcp_end_num),
-       dhcp_pool_size  = CASE WHEN v.dhcp_start_num IS NULL THEN 0
-                              ELSE v.dhcp_end_num - v.dhcp_start_num + 1 END,
-       static_start    = dbo.fn_IntToIp(v.static_start_num),
-       static_end      = dbo.fn_IntToIp(v.static_end_num),
-       static_size     = CASE WHEN v.static_start_num IS NULL OR v.static_end_num IS NULL THEN 0
-                              ELSE v.static_end_num - v.static_start_num + 1 END
-  FROM dbo.vlans v
+       free_count      = s.usable_count - ISNULL(a.cnt, 0),
+       used_percent    = CAST(100.0 * ISNULL(a.cnt, 0) / NULLIF(s.usable_count, 0) AS DECIMAL(5,1)),
+       ip_assignment   = s.ip_assignment,
+       dhcp_start      = dbo.fn_IntToIp(s.dhcp_start_num),
+       dhcp_end        = dbo.fn_IntToIp(s.dhcp_end_num),
+       dhcp_pool_size  = CASE WHEN s.dhcp_start_num IS NULL THEN 0
+                              ELSE s.dhcp_end_num - s.dhcp_start_num + 1 END,
+       static_range_count = ISNULL(r.range_count, 0),
+       static_total_size  = ISNULL(r.total_size, 0),
+       /* "Scope 1 (a-b), Scope 2 (c-d)" — one static range or several,
+          rendered the same way the source spreadsheet listed them. */
+       static_ranges_text = r.ranges_text
+  FROM dbo.vlan_subnets s
+  JOIN dbo.vlans v ON v.vlan_id_pk = s.vlan_id_pk
   OUTER APPLY (
       SELECT cnt = COUNT(*)
         FROM dbo.ip_allocations ia
-       WHERE ia.vlan_id_pk = v.vlan_id_pk
-         AND ia.ip_num BETWEEN v.first_usable_num AND v.last_usable_num
+       WHERE ia.subnet_id = s.subnet_id
+         AND ia.ip_num BETWEEN s.first_usable_num AND s.last_usable_num
   ) a
- WHERE v.is_deleted = 0;
+  OUTER APPLY (
+      SELECT range_count = COUNT(*),
+             total_size  = SUM(sr.end_num - sr.start_num + 1),
+             ranges_text = STRING_AGG(
+                 'Scope ' + CAST(sr.seq_no AS VARCHAR(3)) + ' ('
+                 + dbo.fn_IntToIp(sr.start_num) + '-' + dbo.fn_IntToIp(sr.end_num) + ')', ', '
+             ) WITHIN GROUP (ORDER BY sr.seq_no)
+        FROM dbo.vlan_static_ranges sr
+       WHERE sr.subnet_id = s.subnet_id
+  ) r
+ WHERE s.is_deleted = 0 AND v.is_deleted = 0;
 GO
 
 /* ---------------------------------------------------------------------------
@@ -181,7 +197,7 @@ SELECT s.server_id,
        management_ip  = ip.management_ip,
        ip_count       = ISNULL(ip.ip_count, 0),
        vlan_name      = ip.vlan_name,
-       vlan_id        = ip.vlan_id,
+       vlan_tag       = ip.vlan_tag,
 
        license_count  = ISNULL(lic.cnt, 0),
        share_count    = ISNULL(shr.cnt, 0)
@@ -204,9 +220,10 @@ SELECT s.server_id,
              primary_ip    = MAX(CASE WHEN ia.purpose = 'service'    THEN ia.ip_address END),
              management_ip = MAX(CASE WHEN ia.purpose = 'management' THEN ia.ip_address END),
              vlan_name     = MAX(v.vlan_name),
-             vlan_id       = MAX(v.vlan_id)
+             vlan_tag      = MAX(v.vlan_tag)
         FROM dbo.ip_allocations ia
-        LEFT JOIN dbo.vlans v ON v.vlan_id_pk = ia.vlan_id_pk
+        LEFT JOIN dbo.vlan_subnets sub ON sub.subnet_id = ia.subnet_id
+        LEFT JOIN dbo.vlans v ON v.vlan_id_pk = sub.vlan_id_pk
        WHERE ia.server_id = s.server_id
   ) ip
 
@@ -344,9 +361,11 @@ SELECT a.alloc_id,
        a.assign_type,
        a.purpose,
        a.hostname,
-       vlan_tag   = v.vlan_id,
-       vlan_name  = v.vlan_name,
-       subnet     = v.network_address + '/' + CAST(v.prefix_len AS VARCHAR(2)),
+       vlan_tag    = v.vlan_tag,
+       is_untagged = v.is_untagged,
+       vlan_name   = v.vlan_name,
+       subnet_level = sub.level,
+       subnet      = sub.network_address + '/' + CAST(sub.prefix_len AS VARCHAR(2)),
        owner_kind = CASE WHEN a.server_id   IS NOT NULL THEN 'Server'
                          WHEN a.device_id   IS NOT NULL THEN 'Network device'
                          WHEN a.node_id     IS NOT NULL THEN 'Cluster node'
@@ -356,7 +375,8 @@ SELECT a.alloc_id,
        owner_name = COALESCE(s.server_name, nd.device_name, cn.host_name, h.serial_number),
        a.remarks
   FROM dbo.ip_allocations a
-  LEFT JOIN dbo.vlans           v  ON v.vlan_id_pk  = a.vlan_id_pk
+  LEFT JOIN dbo.vlan_subnets    sub ON sub.subnet_id  = a.subnet_id
+  LEFT JOIN dbo.vlans           v   ON v.vlan_id_pk   = sub.vlan_id_pk
   LEFT JOIN dbo.servers         s  ON s.server_id   = a.server_id
   LEFT JOIN dbo.network_devices nd ON nd.device_id  = a.device_id
   LEFT JOIN dbo.cluster_nodes   cn ON cn.node_id    = a.node_id

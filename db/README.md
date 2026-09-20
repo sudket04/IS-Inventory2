@@ -13,7 +13,9 @@ after an upgrade.
 ```bash
 sqlcmd -S <server> -U <user> -P <password> -Q "CREATE DATABASE ISInventory"
 
-for f in db/0*.sql db/10_seed.sql; do
+for f in db/01_functions.sql db/02_core.sql db/03_assets.sql db/04_network.sql \
+         db/05_software.sql db/06_access.sql db/07_temporal.sql db/08_indexes.sql \
+         db/09_views.sql db/10_seed.sql db/11_applications.sql; do
   sqlcmd -S <server> -U <user> -P <password> -d ISInventory -b -I -i "$f" || break
 done
 ```
@@ -27,13 +29,14 @@ fighting them.
 | `01_functions.sql` | IPv4 ⇄ BIGINT, mask ⇄ prefix, subnet arithmetic, warranty expiry |
 | `02_core.sql` | roles, permissions, role_permissions, app_users, user_site_scope, locations, lookups, `sp_NextId` |
 | `03_assets.sql` | hardware, MA renewals, clusters, cluster_nodes, servers, server_disks, hardware_usage |
-| `04_network.sql` | vlans, network_devices, **ip_allocations** |
+| `04_network.sql` | vlans, vlan_subnets, vlan_static_ranges, network_devices, **ip_allocations** |
 | `05_software.sql` | software_catalogue, software_licenses, software_allocations |
 | `06_access.sql` | ad_users, ad_memberships, server_permissions, audit_log |
 | `07_temporal.sql` | Turns on system versioning + 3-year retention |
 | `08_indexes.sql` | Every FK index and the list/dashboard covering indexes |
 | `09_views.sql` | `v_asset_360`, `v_vlan_utilization`, `v_license_compliance`, `v_warranty_watch`, `v_user_permissions`, … |
-| `10_seed.sql` | 75 permissions, 4 built-in roles, the first admin, location master, lookups |
+| `10_seed.sql` | 80 permissions, 4 built-in roles, the first admin, location master, lookups |
+| `11_applications.sql` | applications (filed under a Server), `v_server_applications` |
 
 ## Tests
 
@@ -62,6 +65,19 @@ switch at the same time. They are BIGINT rows in `dbo.ip_allocations` with
 one estate-wide `UNIQUE`, which also makes "everything in 10.10.120.0/24" a
 range scan and sorts `.9` before `.10`.
 
+**A VLAN and a subnet are not the same thing.** The first draft of this
+schema gave `vlans` one network per row, which cannot represent the site's
+real config: VLAN 4 "FAC1" carries five different `/24`s (one Primary, four
+Secondary — "VLAN Level" in the UI), some VLANs are untagged (the native
+VLAN on a trunk, not "not entered yet"), and one subnet can run DHCP in the
+*middle* of its usable range with two separate static blocks flanking it.
+`dbo.vlans` is now the tag/identity, `dbo.vlan_subnets` is one row per IP
+range hung off it (`level` is Primary/Secondary), and `dbo.vlan_static_ranges`
+holds as many disjoint static blocks as a subnet actually has. DHCP start/end
+are explicit, validated columns rather than derived from "whatever is left
+after one static block" — that derivation could not represent the real
+WIFI-Data-Center subnet at all.
+
 **Foreign keys are foreign keys.** `servers.host_ref` packed two of them into
 one string (`"CLU-001::NODE-005"`), `hardware.used_with` was a JSON array of
 `"cluster:X"`, and `software_allocations` pointed at its target by *name* —
@@ -73,9 +89,11 @@ looking broken. All three are real constrained columns now.
 per-site permission unreliable. Both point at `dbo.locations`.
 
 **Derived values are computed, not typed.** `warranty_expiry` is
-`commission_date + warranty_years`; the DHCP pool is computed from the subnet
-minus the gateway minus the static block — the same rule `app.js` applies in
-the form, so the two cannot drift.
+`commission_date + warranty_years`, a `PERSISTED` computed column — it cannot
+be typed to disagree with the rule that produced it. (The DHCP pool used to
+work the same way — "whatever's left after the static block" — until the
+real config showed DHCP sitting *inside* a subnet with static on both sides;
+see the VLAN note above for why that pool is now stored explicitly instead.)
 
 **History is the engine's job.** `record_versions` stored a full JSON
 snapshot per save, only when the application remembered to write one. The

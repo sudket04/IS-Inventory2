@@ -14,8 +14,36 @@
    so day-to-day queries stay short.
 
    Addresses are BIGINT (see 01_functions.sql). That is what lets
-   "everything in 10.10.120.0/24" be a range scan, and what lets the DHCP
-   pool be computed by the database instead of trusted from the browser.
+   "everything in 10.10.120.0/24" be a range scan, and what lets a DHCP
+   pool's boundaries be validated by the database instead of trusted from
+   the browser.
+
+   ---------------------------------------------------------------------------
+   VLAN model — revised after reviewing the site's real firewall/switch
+   config export. Three things the first pass got wrong:
+
+   1. One VLAN tag can carry SEVERAL subnets (secondary addressing on the
+      same SVI) — the export shows VLAN 4 "FAC1" with five different /24s,
+      one marked Primary and four Secondary. A VLAN and a subnet are not the
+      same thing, so they are two tables now: dbo.vlans (the tag/identity)
+      and dbo.vlan_subnets (one row per IP range hung off it, Level
+      Primary/Secondary is a column on the subnet, not the VLAN).
+
+   2. A VLAN tag is not always a number. The native VLAN on an 802.1Q trunk
+      carries no tag at all — the export's "ThinServer" row literally reads
+      "Untagged" in the VLAN column. vlan_tag is nullable; NULL means
+      untagged, not "not entered yet".
+
+   3. Static and DHCP are not mutually exclusive, and static is not always
+      one contiguous block. The export's WIFI-Data-Center subnet (a /21) has
+      a DHCP pool sitting in the *middle* of the usable range, flanked by two
+      separate static blocks — one below it, one above. The first version of
+      this schema derived a single DHCP range as "whatever is left after one
+      static block", which cannot represent that. DHCP start/end are now
+      explicit columns (validated against the subnet, not computed from it),
+      and static ranges live in their own child table, dbo.vlan_static_ranges,
+      so a subnet can carry as many disjoint static blocks as the network
+      actually has.
    ============================================================================= */
 
 SET ANSI_NULLS ON;
@@ -23,21 +51,62 @@ SET QUOTED_IDENTIFIER ON;
 GO
 
 /* ---------------------------------------------------------------------------
-   VLANs / subnets
+   VLANs — the tag/identity, not the IP range
    --------------------------------------------------------------------------- */
 IF OBJECT_ID('dbo.vlans', 'U') IS NULL
 CREATE TABLE dbo.vlans (
-    vlan_id_pk       VARCHAR(20)   NOT NULL CONSTRAINT PK_vlans PRIMARY KEY,   -- VLA-001
-    vlan_id          INT           NOT NULL
-                     CONSTRAINT CK_vlans_tag CHECK (vlan_id BETWEEN 1 AND 4094),
-    vlan_name        NVARCHAR(80)  NOT NULL,
-    purpose          NVARCHAR(120) NULL,
+    vlan_id_pk   VARCHAR(20)   NOT NULL CONSTRAINT PK_vlans PRIMARY KEY,   -- VLA-001
 
-    /* The subnet, stored as a number + prefix length rather than two dotted
-       strings. subnet_mask is still exposed for the UI, derived not typed. */
+    /* NULL = untagged (the trunk's native VLAN), not "not entered". */
+    vlan_tag     INT           NULL
+                 CONSTRAINT CK_vlans_tag CHECK (vlan_tag BETWEEN 1 AND 4094),
+    is_untagged  AS (CASE WHEN vlan_tag IS NULL THEN CAST(1 AS BIT) ELSE CAST(0 AS BIT) END) PERSISTED,
+
+    vlan_name    NVARCHAR(80)  NOT NULL,
+    vlan_status  VARCHAR(10)   NOT NULL DEFAULT 'Active'
+                 CONSTRAINT CK_vlans_status CHECK (vlan_status IN ('Active','Inactive')),
+    vlan_zone    NVARCHAR(30)  NULL,    -- Trust/Untrust/DMZ — the firewall zone it rides on
+    vlan_by      NVARCHAR(60)  NULL,    -- what created/owns it, e.g. "Core Switch"
+    device_name  NVARCHAR(80)  NULL,    -- the actual device hostname, e.g. "mcp-1"
+    location_id  VARCHAR(20)   NULL
+                 CONSTRAINT FK_vlans_location REFERENCES dbo.locations(location_id),
+    routing      NVARCHAR(120) NULL,
+    remarks      NVARCHAR(400) NULL,
+
+    is_deleted   BIT           NOT NULL DEFAULT 0,
+    deleted_at   DATETIME2(0)  NULL,
+    deleted_by   VARCHAR(20)   NULL CONSTRAINT FK_vlans_deletedby REFERENCES dbo.app_users(user_id),
+    created_at   DATETIME2(0)  NOT NULL DEFAULT SYSUTCDATETIME(),
+    created_by   VARCHAR(20)   NULL CONSTRAINT FK_vlans_createdby REFERENCES dbo.app_users(user_id),
+    updated_at   DATETIME2(0)  NOT NULL DEFAULT SYSUTCDATETIME(),
+    updated_by   VARCHAR(20)   NULL CONSTRAINT FK_vlans_updatedby REFERENCES dbo.app_users(user_id)
+);
+GO
+
+/* A tag only has to be unique on the device that carries it — the same
+   number 4 can legitimately exist on two different firewalls/sites. There
+   is no uniqueness requirement for untagged rows: SQL Server's unique index
+   would only ever allow ONE NULL anyway, and a filtered WHERE vlan_tag IS
+   NOT NULL sidesteps that entirely rather than fighting it. */
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UQ_vlans_tag_device' AND object_id = OBJECT_ID('dbo.vlans'))
+CREATE UNIQUE INDEX UQ_vlans_tag_device ON dbo.vlans(vlan_tag, device_name) WHERE vlan_tag IS NOT NULL AND is_deleted = 0;
+GO
+
+/* ---------------------------------------------------------------------------
+   VLAN subnets — one row per IP range hung off a VLAN. "VLAN Level" in the
+   UI (Primary/Secondary) is the `level` column here.
+   --------------------------------------------------------------------------- */
+IF OBJECT_ID('dbo.vlan_subnets', 'U') IS NULL
+CREATE TABLE dbo.vlan_subnets (
+    subnet_id        VARCHAR(20)   NOT NULL CONSTRAINT PK_vlan_subnets PRIMARY KEY,   -- SUB-001
+    vlan_id_pk       VARCHAR(20)   NOT NULL
+                     CONSTRAINT FK_subnets_vlan REFERENCES dbo.vlans(vlan_id_pk) ON DELETE CASCADE,
+    level            VARCHAR(10)   NOT NULL DEFAULT 'Primary'
+                     CONSTRAINT CK_subnets_level CHECK (level IN ('Primary','Secondary')),
+
     network_num      BIGINT        NOT NULL,
     prefix_len       TINYINT       NOT NULL
-                     CONSTRAINT CK_vlans_prefix CHECK (prefix_len BETWEEN 8 AND 32),
+                     CONSTRAINT CK_subnets_prefix CHECK (prefix_len BETWEEN 8 AND 32),
 
     network_address  AS (dbo.fn_IntToIp(network_num))        PERSISTED,
     subnet_mask      AS (dbo.fn_PrefixToMask(prefix_len))    PERSISTED,
@@ -49,58 +118,141 @@ CREATE TABLE dbo.vlans (
 
     /* network_num must actually be the network address for this prefix —
        10.10.10.5/24 is a typo, not a subnet. */
-    CONSTRAINT CK_vlans_is_network_address CHECK (
+    CONSTRAINT CK_subnets_is_network_address CHECK (
         network_num = network_num & (CAST(4294967295 AS BIGINT) - (LEFT_SHIFT(CAST(1 AS BIGINT), 32 - prefix_len) - 1))
     ),
 
     gateway_num      BIGINT        NULL,
-    gateway_device   NVARCHAR(40)  NULL,
-    firewall_zone    NVARCHAR(30)  NULL,
-    routing          NVARCHAR(120) NULL,
 
-    /* Reserved static block — optional. When set, DHCP starts after it. */
-    static_start_num BIGINT        NULL,
-    static_end_num   BIGINT        NULL,
-    CONSTRAINT CK_vlans_static_order CHECK (
-        static_start_num IS NULL OR static_end_num IS NULL OR static_end_num >= static_start_num
+    /* A subnet can hand out addresses by static assignment, DHCP, or both at
+       once (the WIFI-Data-Center /21: static below and above a DHCP pool in
+       the middle). This flag says which apply; the actual ranges live in
+       vlan_static_ranges (0..N rows) and the two dhcp_* columns below. */
+    ip_assignment    VARCHAR(12)   NOT NULL DEFAULT 'Static'
+                     CONSTRAINT CK_subnets_assignment CHECK (ip_assignment IN ('Static','DHCP','Static+DHCP')),
+
+    dhcp_server_num  BIGINT        NULL,
+    dhcp_start_num   BIGINT        NULL,
+    dhcp_end_num     BIGINT        NULL,
+
+    /* DHCP fields are explicit, not derived — a pool can sit anywhere in the
+       range, not only "after the last static block". They still have to be
+       real addresses inside this subnet's usable range. */
+    CONSTRAINT CK_subnets_dhcp_shape CHECK (
+        (ip_assignment NOT LIKE '%DHCP%' AND dhcp_server_num IS NULL AND dhcp_start_num IS NULL AND dhcp_end_num IS NULL)
+     OR (ip_assignment LIKE '%DHCP%' AND dhcp_server_num IS NOT NULL
+         AND dhcp_start_num IS NOT NULL AND dhcp_end_num IS NOT NULL AND dhcp_end_num >= dhcp_start_num)
+    ),
+    CONSTRAINT CK_subnets_dhcp_in_range CHECK (
+        dhcp_start_num IS NULL
+        OR (dhcp_start_num >= first_usable_num AND dhcp_end_num <= last_usable_num)
     ),
 
-    /* DHCP. Defaults to off; the form hides every DHCP field until it is on. */
-    dhcp_enabled     BIT           NOT NULL DEFAULT 0,
-    dhcp_server_num  BIGINT        NULL,
-
-    /* Derived, never typed — the form renders these read-only. NULL when the
-       subnet has no room left once gateway and static block are excluded,
-       which is the condition the save-time validation reports. */
-    dhcp_start_num   AS (CASE WHEN dhcp_enabled = 1
-                              THEN dbo.fn_DhcpStart(network_num, prefix_len, gateway_num,
-                                                    static_start_num, static_end_num)
-                         END) PERSISTED,
-    dhcp_end_num     AS (CASE WHEN dhcp_enabled = 1
-                              THEN dbo.fn_LastUsable(network_num, prefix_len)
-                         END) PERSISTED,
-
-    /* A DHCP-enabled VLAN must name the server handing out the leases. */
-    CONSTRAINT CK_vlans_dhcp_server CHECK (dhcp_enabled = 0 OR dhcp_server_num IS NOT NULL),
+    remarks          NVARCHAR(400) NULL,
 
     is_deleted       BIT           NOT NULL DEFAULT 0,
     deleted_at       DATETIME2(0)  NULL,
-    deleted_by       VARCHAR(20)   NULL CONSTRAINT FK_vlans_deletedby REFERENCES dbo.app_users(user_id),
+    deleted_by       VARCHAR(20)   NULL CONSTRAINT FK_subnets_deletedby REFERENCES dbo.app_users(user_id),
     created_at       DATETIME2(0)  NOT NULL DEFAULT SYSUTCDATETIME(),
-    created_by       VARCHAR(20)   NULL CONSTRAINT FK_vlans_createdby REFERENCES dbo.app_users(user_id),
+    created_by       VARCHAR(20)   NULL CONSTRAINT FK_subnets_createdby REFERENCES dbo.app_users(user_id),
     updated_at       DATETIME2(0)  NOT NULL DEFAULT SYSUTCDATETIME(),
-    updated_by       VARCHAR(20)   NULL CONSTRAINT FK_vlans_updatedby REFERENCES dbo.app_users(user_id)
+    updated_by       VARCHAR(20)   NULL CONSTRAINT FK_subnets_updatedby REFERENCES dbo.app_users(user_id)
 );
 GO
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UQ_vlans_tag' AND object_id = OBJECT_ID('dbo.vlans'))
-CREATE UNIQUE INDEX UQ_vlans_tag ON dbo.vlans(vlan_id) WHERE is_deleted = 0;
+/* At most one Primary subnet per VLAN — Secondary can repeat freely. */
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UQ_subnets_one_primary' AND object_id = OBJECT_ID('dbo.vlan_subnets'))
+CREATE UNIQUE INDEX UQ_subnets_one_primary ON dbo.vlan_subnets(vlan_id_pk) WHERE level = 'Primary' AND is_deleted = 0;
 GO
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UQ_vlans_name' AND object_id = OBJECT_ID('dbo.vlans'))
-CREATE UNIQUE INDEX UQ_vlans_name ON dbo.vlans(vlan_name) WHERE is_deleted = 0;
+/* No two live subnets anywhere describe the same network, whatever VLAN
+   they are attached to. */
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UQ_subnets_network' AND object_id = OBJECT_ID('dbo.vlan_subnets'))
+CREATE UNIQUE INDEX UQ_subnets_network ON dbo.vlan_subnets(network_num, prefix_len) WHERE is_deleted = 0;
 GO
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UQ_vlans_network' AND object_id = OBJECT_ID('dbo.vlans'))
-CREATE UNIQUE INDEX UQ_vlans_network ON dbo.vlans(network_num, prefix_len) WHERE is_deleted = 0;
+
+/* ---------------------------------------------------------------------------
+   Static IP ranges — 0..N per subnet, e.g. one below and one above a
+   DHCP pool. A CHECK constraint cannot compare rows against each other or
+   against a different table, so the "stay inside the subnet, never overlap
+   the DHCP pool or another static range" rules are enforced by the trigger
+   further down, once both this table and vlan_subnets exist.
+   --------------------------------------------------------------------------- */
+IF OBJECT_ID('dbo.vlan_static_ranges', 'U') IS NULL
+CREATE TABLE dbo.vlan_static_ranges (
+    range_id    VARCHAR(20)  NOT NULL CONSTRAINT PK_vlan_static_ranges PRIMARY KEY,  -- STR-001
+    subnet_id   VARCHAR(20)  NOT NULL
+                CONSTRAINT FK_staticrange_subnet REFERENCES dbo.vlan_subnets(subnet_id) ON DELETE CASCADE,
+    seq_no      INT          NOT NULL DEFAULT 1,   -- display order: Scope 1, Scope 2, ...
+    start_num   BIGINT       NOT NULL,
+    end_num     BIGINT       NOT NULL,
+    remarks     NVARCHAR(200) NULL,
+    created_at  DATETIME2(0) NOT NULL DEFAULT SYSUTCDATETIME(),
+
+    CONSTRAINT UQ_staticrange_seq UNIQUE (subnet_id, seq_no),
+    CONSTRAINT CK_staticrange_order CHECK (end_num >= start_num)
+);
+GO
+
+/* Every static range must sit inside its subnet's usable bounds, and must
+   not overlap the subnet's DHCP pool or any other static range on the same
+   subnet. Two disjoint interval-overlap checks, done set-based so a
+   multi-row insert/update stays one statement. */
+CREATE OR ALTER TRIGGER dbo.trg_vlan_static_ranges_valid
+ON dbo.vlan_static_ranges
+AFTER INSERT, UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF EXISTS (
+        SELECT 1
+          FROM inserted i
+          JOIN dbo.vlan_subnets s ON s.subnet_id = i.subnet_id
+         WHERE i.start_num < s.first_usable_num OR i.end_num > s.last_usable_num
+    )
+        THROW 50002, 'A static range must fall inside the usable range of its subnet.', 1;
+
+    IF EXISTS (
+        SELECT 1
+          FROM inserted i
+          JOIN dbo.vlan_subnets s ON s.subnet_id = i.subnet_id
+         WHERE s.dhcp_start_num IS NOT NULL
+           AND i.start_num <= s.dhcp_end_num AND i.end_num >= s.dhcp_start_num
+    )
+        THROW 50003, 'A static range overlaps this subnet''s DHCP pool.', 1;
+
+    IF EXISTS (
+        SELECT 1
+          FROM inserted i
+          JOIN dbo.vlan_static_ranges other
+            ON other.subnet_id = i.subnet_id
+           AND other.range_id <> i.range_id
+           AND i.start_num <= other.end_num AND i.end_num >= other.start_num
+    )
+        THROW 50004, 'Two static ranges on the same subnet overlap.', 1;
+END;
+GO
+
+/* The mirror check, from the subnet side: setting/changing a DHCP pool must
+   not land it on top of an existing static range. */
+CREATE OR ALTER TRIGGER dbo.trg_vlan_subnets_dhcp_no_overlap
+ON dbo.vlan_subnets
+AFTER INSERT, UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF EXISTS (
+        SELECT 1
+          FROM inserted i
+          JOIN dbo.vlan_static_ranges r ON r.subnet_id = i.subnet_id
+         WHERE i.dhcp_start_num IS NOT NULL
+           AND i.dhcp_start_num <= r.end_num AND i.dhcp_end_num >= r.start_num
+    )
+        THROW 50005, 'This subnet''s DHCP pool overlaps one of its static ranges.', 1;
+END;
+GO
+
 GO
 
 /* ---------------------------------------------------------------------------
@@ -182,8 +334,8 @@ CREATE TABLE dbo.ip_allocations (
     ip_num       BIGINT        NOT NULL,
     ip_address   AS (dbo.fn_IntToIp(ip_num)) PERSISTED,
 
-    vlan_id_pk   VARCHAR(20)   NULL
-                 CONSTRAINT FK_ipalloc_vlan REFERENCES dbo.vlans(vlan_id_pk),
+    subnet_id    VARCHAR(20)   NULL
+                 CONSTRAINT FK_ipalloc_subnet REFERENCES dbo.vlan_subnets(subnet_id),
 
     assign_type  VARCHAR(10)   NOT NULL DEFAULT 'Static'
                  CONSTRAINT CK_ipalloc_assign CHECK (assign_type IN ('Static','DHCP','Reserved')),
@@ -233,11 +385,11 @@ BEGIN
     IF EXISTS (
         SELECT 1
           FROM inserted i
-          JOIN dbo.vlans v ON v.vlan_id_pk = i.vlan_id_pk
-         WHERE i.ip_num NOT BETWEEN v.network_num AND v.broadcast_num
+          JOIN dbo.vlan_subnets s ON s.subnet_id = i.subnet_id
+         WHERE i.ip_num NOT BETWEEN s.network_num AND s.broadcast_num
     )
     BEGIN
-        THROW 50001, 'IP address falls outside the network range of the VLAN it is assigned to.', 1;
+        THROW 50001, 'IP address falls outside the network range of the subnet it is assigned to.', 1;
     END
 END;
 GO

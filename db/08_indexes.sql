@@ -53,11 +53,17 @@ GO
    is missing is the reverse direction — "which addresses belong to this
    VLAN / this server?" — and a covering index so the estate-wide IP list
    never touches the base table.                                             */
-CREATE NONCLUSTERED INDEX IX_ipalloc_vlan   ON dbo.ip_allocations(vlan_id_pk, ip_num)
+CREATE NONCLUSTERED INDEX IX_ipalloc_subnet ON dbo.ip_allocations(subnet_id, ip_num)
     INCLUDE (assign_type, purpose, hostname);
 CREATE NONCLUSTERED INDEX IX_ipalloc_server ON dbo.ip_allocations(server_id) WHERE server_id IS NOT NULL;
 CREATE NONCLUSTERED INDEX IX_ipalloc_device ON dbo.ip_allocations(device_id) WHERE device_id IS NOT NULL;
 CREATE NONCLUSTERED INDEX IX_ipalloc_node   ON dbo.ip_allocations(node_id)   WHERE node_id   IS NOT NULL;
+GO
+
+/* --- VLAN subnet/static-range lookups ---------------------------------- */
+CREATE NONCLUSTERED INDEX IX_vlansubnets_vlan   ON dbo.vlan_subnets(vlan_id_pk) WHERE is_deleted = 0;
+CREATE NONCLUSTERED INDEX IX_staticrange_subnet ON dbo.vlan_static_ranges(subnet_id, seq_no);
+CREATE NONCLUSTERED INDEX IX_vlans_location     ON dbo.vlans(location_id) WHERE is_deleted = 0;
 GO
 
 /* --- The list screens ------------------------------------------------------
@@ -110,5 +116,6 @@ GO
 CREATE NONCLUSTERED INDEX IX_hardware_deleted ON dbo.hardware(deleted_at DESC) WHERE is_deleted = 1;
 CREATE NONCLUSTERED INDEX IX_servers_deleted  ON dbo.servers(deleted_at DESC)  WHERE is_deleted = 1;
 CREATE NONCLUSTERED INDEX IX_netdev_deleted   ON dbo.network_devices(deleted_at DESC) WHERE is_deleted = 1;
-CREATE NONCLUSTERED INDEX IX_vlans_deleted    ON dbo.vlans(deleted_at DESC)    WHERE is_deleted = 1;
+CREATE NONCLUSTERED INDEX IX_vlans_deleted        ON dbo.vlans(deleted_at DESC)        WHERE is_deleted = 1;
+CREATE NONCLUSTERED INDEX IX_vlan_subnets_deleted ON dbo.vlan_subnets(deleted_at DESC) WHERE is_deleted = 1;
 GO

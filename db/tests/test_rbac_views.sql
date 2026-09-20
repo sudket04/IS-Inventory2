@@ -8,9 +8,9 @@ SET NOCOUNT ON;
 GO
 
 PRINT '=== RBAC seed ===';
-SELECT test = '15 modules x 5 actions = 75 permissions',
+SELECT test = '16 modules x 5 actions = 80 permissions',
        actual = COUNT(*),
-       result = CASE WHEN COUNT(*) = 75 THEN 'PASS' ELSE 'FAIL' END
+       result = CASE WHEN COUNT(*) = 80 THEN 'PASS' ELSE 'FAIL' END
   FROM dbo.permissions;
 
 SELECT test = 'Administrator holds every permission',
@@ -117,23 +117,27 @@ INSERT INTO dbo.server_disks (disk_id, server_id, drive_letter, capacity, unit)
 VALUES ('DSK-T01', 'SRV-T01', N'C:', 100, 'GB'),
        ('DSK-T02', 'SRV-T01', N'D:', 1,   'TB');
 
-INSERT INTO dbo.vlans (vlan_id_pk, vlan_id, vlan_name, network_num, prefix_len,
-                       gateway_num, dhcp_enabled, dhcp_server_num)
-VALUES ('VLA-T10', 120, N'HDC-SERVER', dbo.fn_IpToInt('10.10.120.0'), 24,
-        dbo.fn_IpToInt('10.10.120.1'), 1, dbo.fn_IpToInt('10.10.120.1'));
+INSERT INTO dbo.vlans (vlan_id_pk, vlan_tag, vlan_name, device_name)
+VALUES ('VLA-T10', 120, N'HDC-SERVER', N'mcp-1');
 
-INSERT INTO dbo.ip_allocations (ip_num, vlan_id_pk, assign_type, purpose, server_id, hostname)
-VALUES (dbo.fn_IpToInt('10.10.120.42'), 'VLA-T10', 'Static', 'service',    'SRV-T01', N'HDC-APP01'),
-       (dbo.fn_IpToInt('10.10.120.43'), 'VLA-T10', 'Static', 'management', 'SRV-T01', N'HDC-APP01-mgmt');
+INSERT INTO dbo.vlan_subnets (subnet_id, vlan_id_pk, level, network_num, prefix_len,
+                              gateway_num, ip_assignment, dhcp_server_num, dhcp_start_num, dhcp_end_num)
+VALUES ('SUB-T10', 'VLA-T10', 'Primary', dbo.fn_IpToInt('10.10.120.0'), 24,
+        dbo.fn_IpToInt('10.10.120.1'), 'DHCP',
+        dbo.fn_IpToInt('10.10.120.1'), dbo.fn_IpToInt('10.10.120.2'), dbo.fn_IpToInt('10.10.120.254'));
+
+INSERT INTO dbo.ip_allocations (ip_num, subnet_id, assign_type, purpose, server_id, hostname)
+VALUES (dbo.fn_IpToInt('10.10.120.42'), 'SUB-T10', 'Static', 'service',    'SRV-T01', N'HDC-APP01'),
+       (dbo.fn_IpToInt('10.10.120.43'), 'SUB-T10', 'Static', 'management', 'SRV-T01', N'HDC-APP01-mgmt');
 
 PRINT '=== v_asset_360: the side panel in one query ===';
 SELECT test = 'server resolves location, specs, IPs and VLAN in one row',
-       server_name, location_path, primary_ip, management_ip, vlan_id,
+       server_name, location_path, primary_ip, management_ip, vlan_tag,
        disk_total_gb, warranty_expiry, ip_count,
        result = CASE WHEN location_path  = N'1st Site › HDC › Floor 3 › Rack-A12'
                       AND primary_ip     = '10.10.120.42'
                       AND management_ip  = '10.10.120.43'
-                      AND vlan_id        = 120
+                      AND vlan_tag       = 120
                       AND disk_total_gb  = 1124          -- 100 GB + 1 TB, normalised
                       AND warranty_expiry = '2029-01-15' -- 2026-01-15 + 3 years
                       AND ip_count       = 2
@@ -146,7 +150,7 @@ SELECT test = '2 of 254 usable addresses taken in VLAN 120',
        result = CASE WHEN usable_count = 254 AND assigned_count = 2 AND free_count = 252
                       AND dhcp_start = '10.10.120.2' AND dhcp_end = '10.10.120.254'
                      THEN 'PASS' ELSE 'FAIL' END
-  FROM dbo.v_vlan_utilization WHERE vlan_id = 120;
+  FROM dbo.v_vlan_utilization WHERE vlan_tag = 120;
 
 PRINT '=== v_license_compliance: over-allocation is detected ===';
 INSERT INTO dbo.software_catalogue (software_id, vendor, name, edition, category, type)
@@ -178,6 +182,27 @@ SELECT test = 'allocation survives the rename',
        allocated_qty,
        result = CASE WHEN allocated_qty = 12 THEN 'PASS' ELSE 'FAIL' END
   FROM dbo.v_license_compliance WHERE license_id = 'LIC-T01';
+
+PRINT '=== Applications: filed under a Server, Server Type derived not typed ===';
+INSERT INTO dbo.applications (application_id, server_id, application_name, port_number, link_url, incharge, department)
+VALUES ('APP-T01', 'SRV-T01', N'ERP Web Portal', N'443, 8443', N'https://erp.internal.local', N'Somchai', N'IT Infrastructure');
+
+SELECT test = 'server_type is derived from the server row (Virtual / Windows Server 2022)',
+       server_type, server_name, site_name,
+       result = CASE WHEN server_type = N'Virtual / Windows Server 2022'
+                      AND server_name = N'HDC-APP01-RENAMED'
+                      AND site_name   = N'1st Site'
+                     THEN 'PASS' ELSE 'FAIL' END
+  FROM dbo.v_server_applications WHERE application_id = 'APP-T01';
+
+BEGIN TRY
+    INSERT INTO dbo.applications (application_id, server_id, application_name, port_number)
+    VALUES ('APP-T02', 'SRV-T01', N'ERP Web Portal', N'443, 8443');
+    SELECT test = 'reject the exact same app+port re-added to the same live server', result = 'FAIL (it was accepted)';
+END TRY
+BEGIN CATCH
+    SELECT test = 'reject the exact same app+port re-added to the same live server', result = 'PASS';
+END CATCH;
 
 PRINT '=== v_warranty_watch ===';
 SELECT test = 'hardware warranty shows as Valid with days remaining',
@@ -228,10 +253,13 @@ BEGIN CATCH
 END CATCH;
 
 /* --- clean up --------------------------------------------------------------- */
+DELETE FROM dbo.applications         WHERE application_id LIKE 'APP-T%';
 DELETE FROM dbo.software_allocations WHERE allocation_id LIKE 'ALC-T%';
 DELETE FROM dbo.software_licenses    WHERE license_id    LIKE 'LIC-T%';
 DELETE FROM dbo.software_catalogue   WHERE software_id   LIKE 'SWC-T%';
-DELETE FROM dbo.ip_allocations       WHERE vlan_id_pk    LIKE 'VLA-T%';
+DELETE FROM dbo.ip_allocations       WHERE subnet_id     LIKE 'SUB-T%';
+DELETE FROM dbo.vlan_static_ranges   WHERE subnet_id     LIKE 'SUB-T%';
+DELETE FROM dbo.vlan_subnets         WHERE vlan_id_pk    LIKE 'VLA-T%';
 DELETE FROM dbo.vlans                WHERE vlan_id_pk    LIKE 'VLA-T%';
 DELETE FROM dbo.server_disks         WHERE disk_id       LIKE 'DSK-T%';
 DELETE FROM dbo.servers              WHERE server_id     LIKE 'SRV-T%';

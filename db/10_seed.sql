@@ -32,6 +32,7 @@ INSERT INTO @modules (module_key, label, sort_order) VALUES
     ('server_permissions',   N'Server permissions',  110),
     ('ad_users',             N'AD users',            120),
     ('locations',            N'Locations & racks',   130),
+    ('applications',         N'Applications',        135),
     ('lifecycle',            N'Warranty & history',  140),
     ('users',                N'Users & roles',       150);
 
@@ -105,7 +106,7 @@ SELECT 'ROL-003', p.permission_id
         /* read-only everywhere else it needs context */
      OR (p.module_key IN ('dashboard','servers','clusters','vlans',
                           'software_catalogue','software_licenses','software_allocations',
-                          'server_permissions','ad_users','lifecycle')
+                          'server_permissions','ad_users','lifecycle','applications')
          AND p.action IN ('view','export'))
    )
    AND NOT EXISTS (SELECT 1 FROM dbo.role_permissions rp
@@ -145,8 +146,8 @@ GO
    --------------------------------------------------------------------------- */
 MERGE dbo.id_counters AS t
 USING (VALUES ('USR',1),('ROL',4),('HW',0),('CLU',0),('NOD',0),('SRV',0),('DSK',0),
-              ('HWU',0),('MAR',0),('LOC',0),('VLA',0),('NET',0),('SWC',0),('LIC',0),
-              ('ALC',0),('PRM',0),('AD',0),('MBR',0)
+              ('HWU',0),('MAR',0),('LOC',0),('VLA',0),('SUB',0),('STR',0),('NET',0),
+              ('SWC',0),('LIC',0),('ALC',0),('PRM',0),('AD',0),('MBR',0),('APP',0)
       ) AS s(counter_key, next_seq)
    ON t.counter_key = s.counter_key
  WHEN NOT MATCHED THEN INSERT (counter_key, next_seq) VALUES (s.counter_key, s.next_seq);
