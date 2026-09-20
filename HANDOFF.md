@@ -1,8 +1,11 @@
 # Handoff — IS-Inventory database v2
 
 **Branch:** `claude/brave-edison-te5508`
-**Latest commit:** `3896941` — "Redesign VLAN model for multi-subnet/untagged/split DHCP; add Applications"
-**Status:** Database schema is done and tested. Frontend (`app.js`) is **not** updated yet — that's the next job.
+**Latest commit:** `a1f19fd` — "Add JWT auth, nested VLAN API, and React/Vite/Tailwind frontend"
+**Status:** Database schema is done and tested. Backend now has real auth + a nested
+VLAN API. A new React frontend (`frontend/`) is scaffolded and wired to it — VLAN
+editor, Applications tab, and the Site-scoped Server list are real; most other pages
+are still stubs. The legacy `app.js`/`index.html` is untouched and still serves at `/`.
 
 ## Where things stand
 
@@ -39,40 +42,70 @@ Everything is covered by triggers/CHECK constraints for the cases that matter:
 overlapping static ranges, static overlapping DHCP, ranges outside subnet bounds, more
 than one Primary subnet per VLAN, duplicate tag on the same device.
 
-### Not done — `app.js`
+Also since the DB round: `hardware.location_id` and `vlans.location_id` are now
+`NOT NULL` — every data-entry form must resolve to a site. The two-site limit (1st
+Site/2nd Site) stays a `10_seed.sql` convention, not a DB CHECK.
 
-`app.js` is the existing localStorage-based frontend (~3,800 lines) and is **not wired
-to this schema at all** (`routers/records.py` has its own comment saying the API isn't
-hooked into `index.html` yet). It still assumes the old model:
+### Done — backend (`app.py`, `auth.py`, `routers/`)
 
-- VLAN field is a required integer (no Untagged option)
-- One VLAN = one subnet (no Primary/Secondary levels)
-- One static range + auto-computed DHCP (`wireVlanDhcpCascade()`)
-- No Applications page/section anywhere
+The stack decision that had stalled from before the VLAN spreadsheet: **kept FastAPI +
+pyodbc** (it already existed and matches this schema), did not rewrite it in Node —
+Node is now only the frontend's build tool.
 
-This was deliberately left alone rather than rushed — it's a separate, sizeable
-frontend task, not a schema task.
+- `auth.py` / `routers/auth.py`: real login. bcrypt-verifies against
+  `dbo.app_users`, issues an httpOnly JWT cookie carrying `role_id` and the caller's
+  `user_site_scope` rows. `auth.require_permission(module, action)` does a live
+  `dbo.role_permissions` lookup (revoking a permission takes effect on that user's
+  very next request); `auth.require_site_access` checks a Staff account's site list
+  against a record's `location_id`.
+- `routers/vlans.py`: the nested API the generic single-table CRUD can't do — a
+  VLAN's subnets and a subnet's static ranges are multi-table writes.
+  `GET /api/vlans/{id}/full` returns a VLAN with its subnets and each subnet's static
+  ranges nested. IP fields go through `dbo.fn_IpToInt` inline in SQL, never
+  reimplemented in Python; the DB triggers still do the actual overlap validation,
+  this only turns their errors into a readable message.
+- `routers/records.py`: was previously **unauthenticated** — now every verb checks
+  `require_permission` and, for `hardware`/`vlans` (the tables that carry
+  `location_id` directly), site scope too.
+- `table_registry.py`: registered `applications` as a flat CRUD table.
+
+### Done — frontend (`frontend/`, React + Vite + Tailwind + TanStack Query)
+
+New, separate from the legacy frontend — `app.js`/`index.html` are untouched at `/`,
+kept as reference/rollback per the earlier decision not to rewrite over them blind.
+`npm run build` writes `frontend/dist`, which `app.py` mounts at `/app` automatically
+once present.
+
+Real and wired to the endpoints above:
+- Login/session (cookie-based, `RequireAuth` redirects to `/login` on 401)
+- **VlanEditor** + **SubnetRow**: Untagged toggle, add/remove Primary/Secondary
+  subnets, per-subnet IP Assignment (Static/DHCP/Static+DHCP), multiple static
+  ranges, explicit DHCP fields — the full nested shape from `04_network.sql`
+- **ApplicationsTab** under Server detail — `server_type` shown read-only, derived
+  from the server, never entered as its own field
+- **Servers** list: Site as a table column + filter (not a separate switcher, per
+  the UX decision), disabled lock icon on rows outside the logged-in user's scope
+- **SiteSelect**: the mandatory site field on the VLAN editor form
+
+Still stubs, not yet built (see `frontend/README.md`): Dashboard, Hardware/Software
+Catalogue/Users & Roles list pages (copy `Servers.jsx` as the template), and the
+"+ เพิ่มใหม่" create-new flows on both Servers and VLAN.
 
 ## Next steps, in likely order
 
-1. **Decide the web stack** (this was in progress and got interrupted before the VLAN
-   spreadsheet came in — see the abandoned Node.js/tedious/mssql/kysely connectivity
-   test in `/tmp/claude-0/stacktest` from the prior session, now stale). `app.js` today
-   is client-only localStorage with no real backend talking to SQL Server; that has to
-   be settled before any of the UI work below can land for real.
-2. **Rebuild the VLAN form** in `app.js` (or its replacement) to match the new schema:
-   Untagged toggle vs. numeric tag, add/remove secondary subnets under one VLAN,
-   multiple static ranges, explicit DHCP fields with the same overlap validation the
-   DB triggers enforce.
-3. **Build the Applications page**, filed under Server: Server Name (lookup), Server
-   Type (read-only, derived), Application Name, Port Number, Link Application,
-   Incharge, Department/Section — backed by `dbo.applications` /
-   `v_server_applications`.
+1. **Wire up create-new flows** — VlanEditor and ApplicationsTab assume the parent
+   record already exists; there's no "create a brand-new VLAN/Server" screen yet.
+2. **Build the remaining list pages** (Hardware, Software Catalogue, Users & Roles,
+   Network Devices) using `Servers.jsx` as the template — same Site column + filter
+   pattern, same permission-checked API underneath.
+3. **Dashboard** — warranty/MA-expiry watch, license compliance, the actual landing
+   page after login (currently a placeholder route).
 4. **Migrate existing localStorage data** into the new schema — noted as a separate,
    not-yet-written script in `db/README.md`.
 5. Before any production run: re-hash the seeded admin password
    (`10_seed.sql` ships a bcrypt hash of the placeholder `ChangeMe$2026`, plaintext in
-   version control by definition).
+   version control by definition), and generate real `jwt_secret.key`/`secret.key`
+   files per environment (both are gitignored, auto-created on first run).
 
 ## How to verify the DB side yourself
 
