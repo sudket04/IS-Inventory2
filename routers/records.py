@@ -20,7 +20,7 @@ StorageAdapter's get/set for calls to these endpoints table-by-table.
 from typing import Any, Dict, Optional
 
 import pyodbc
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 
 import auth
@@ -29,6 +29,12 @@ from config import load_config
 from table_registry import TABLE_REGISTRY
 
 router = APIRouter(prefix="/api/records")
+
+# Tables whose rows carry a location_id directly, so a Staff account's site
+# scope can be checked against it (see auth.require_site_access). Tables not
+# listed here have no direct site column — servers/applications resolve
+# their site through a join, out of scope for this generic endpoint.
+_SITE_SCOPED_TABLES = {"hardware", "vlans"}
 
 
 def _require_config():
@@ -57,17 +63,43 @@ def _extract_values(payload: Dict[str, Any], writable: list, spec) -> Dict[str, 
     return values
 
 
+def _site_check(table: str, user: Dict[str, Any], location_id: Optional[str]) -> None:
+    if table in _SITE_SCOPED_TABLES and location_id:
+        auth.require_site_access(user, location_id)
+
+
+def _check_permission(cfg, user: Dict[str, Any], table: str, action: str) -> None:
+    """Same live role_permissions lookup as auth.require_permission, but
+    callable with a table name only known at request time — this router's
+    `table` is a path parameter, so the module_key can't be fixed at
+    dependency-declaration time the way routers/vlans.py's can.
+    """
+    conn = db.get_connection(cfg)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT 1 FROM dbo.role_permissions WHERE role_id = ? AND permission_id = ?",
+            user["role_id"], f"{table}.{action}",
+        )
+        if cursor.fetchone() is None:
+            raise HTTPException(status_code=403, detail=f"Your role cannot {action} {table}.")
+    finally:
+        conn.close()
+
+
 @router.get("/{table}")
-async def list_records(table: str):
+async def list_records(table: str, user: Dict[str, Any] = Depends(auth.get_current_user)):
     cfg = _require_config()
     spec = _require_spec(table)
+    _check_permission(cfg, user, table, "view")
     return db.fetch_all(cfg, spec.table, spec.id_column)
 
 
 @router.get("/{table}/{record_id}")
-async def get_record(table: str, record_id: str):
+async def get_record(table: str, record_id: str, user: Dict[str, Any] = Depends(auth.get_current_user)):
     cfg = _require_config()
     spec = _require_spec(table)
+    _check_permission(cfg, user, table, "view")
     record = db.fetch_one(cfg, spec.table, spec.id_column, record_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Not found")
@@ -75,9 +107,11 @@ async def get_record(table: str, record_id: str):
 
 
 @router.post("/{table}")
-async def create_record(table: str, payload: Dict[str, Any]):
+async def create_record(table: str, payload: Dict[str, Any], user: Dict[str, Any] = Depends(auth.get_current_user)):
     cfg = _require_config()
     spec = _require_spec(table)
+    _check_permission(cfg, user, table, "create")
+    _site_check(table, user, payload.get("location_id"))
     writable = _writable_columns(cfg, spec)
     values = _extract_values(payload, writable, spec)
     values[spec.id_column] = db.next_id(cfg, spec.id_prefix)
@@ -89,12 +123,17 @@ async def create_record(table: str, payload: Dict[str, Any]):
 
 
 @router.put("/{table}/{record_id}")
-async def update_record(table: str, record_id: str, payload: Dict[str, Any]):
+async def update_record(table: str, record_id: str, payload: Dict[str, Any],
+                         user: Dict[str, Any] = Depends(auth.get_current_user)):
     cfg = _require_config()
     spec = _require_spec(table)
+    _check_permission(cfg, user, table, "edit")
     existing = db.fetch_one(cfg, spec.table, spec.id_column, record_id)
     if existing is None:
         raise HTTPException(status_code=404, detail="Not found")
+    # Scope is checked against the record's CURRENT site, not a site value
+    # the client might try to smuggle in the payload to move it elsewhere.
+    _site_check(table, user, existing.get("location_id"))
 
     writable = _writable_columns(cfg, spec)
     values = _extract_values(payload, writable, spec)
@@ -117,9 +156,14 @@ async def update_record(table: str, record_id: str, payload: Dict[str, Any]):
 
 
 @router.delete("/{table}/{record_id}")
-async def delete_record(table: str, record_id: str):
+async def delete_record(table: str, record_id: str, user: Dict[str, Any] = Depends(auth.get_current_user)):
     cfg = _require_config()
     spec = _require_spec(table)
+    _check_permission(cfg, user, table, "delete")
+    existing = db.fetch_one(cfg, spec.table, spec.id_column, record_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    _site_check(table, user, existing.get("location_id"))
     try:
         ok = db.delete_row(cfg, spec.table, spec.id_column, record_id)
     except pyodbc.IntegrityError as exc:

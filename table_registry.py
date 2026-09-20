@@ -38,4 +38,5 @@ TABLE_REGISTRY = {
     "software_catalogue": TableSpec(table="software_catalogue", id_column="software_id", id_prefix="SWC"),
     "software_licenses": TableSpec(table="software_licenses", id_column="license_id", id_prefix="LIC"),
     "software_allocations": TableSpec(table="software_allocations", id_column="allocation_id", id_prefix="ALC"),
+    "applications": TableSpec(table="applications", id_column="application_id", id_prefix="APP"),
 }
